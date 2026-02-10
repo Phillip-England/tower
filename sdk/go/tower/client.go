@@ -19,11 +19,11 @@ type Client struct {
 }
 
 type Message struct {
-	ID        int64      `json:"ID"`
-	UserID    string     `json:"UserID"`
-	Body      string     `json:"Body"`
-	CreatedAt time.Time  `json:"CreatedAt"`
-	ReadAt    *time.Time `json:"ReadAt"`
+	ID        int64      `json:"id"`
+	UserID    string     `json:"user_id"`
+	Body      string     `json:"body"`
+	CreatedAt time.Time  `json:"created_at"`
+	ReadAt    *time.Time `json:"read_at"`
 }
 
 func New(baseURL, userID, key string) *Client {
@@ -52,14 +52,39 @@ func (c *Client) SendMessage(ctx context.Context, body string) (int64, error) {
 	return resp.ID, err
 }
 
-func (c *Client) ListMessages(ctx context.Context, limit int) ([]Message, error) {
+func (c *Client) ListMessages(ctx context.Context, limit, offset int) ([]Message, error) {
 	endpoint := "/api/v1/messages"
+	params := url.Values{}
 	if limit > 0 {
-		endpoint += "?limit=" + strconv.Itoa(limit)
+		params.Set("limit", strconv.Itoa(limit))
+	}
+	if offset > 0 {
+		params.Set("offset", strconv.Itoa(offset))
+	}
+	if len(params) > 0 {
+		endpoint += "?" + params.Encode()
 	}
 	var msgs []Message
 	err := c.get(ctx, endpoint, &msgs)
 	return msgs, err
+}
+
+func (c *Client) GetMessage(ctx context.Context, id int64) (Message, error) {
+	var msg Message
+	err := c.get(ctx, fmt.Sprintf("/api/v1/messages/%d", id), &msg)
+	return msg, err
+}
+
+func (c *Client) MarkMessageRead(ctx context.Context, id int64) error {
+	return c.patch(ctx, fmt.Sprintf("/api/v1/messages/%d", id))
+}
+
+func (c *Client) UnreadCount(ctx context.Context) (int, error) {
+	var resp struct {
+		UnreadCount int `json:"unread_count"`
+	}
+	err := c.get(ctx, "/api/v1/messages/unread-count", &resp)
+	return resp.UnreadCount, err
 }
 
 func (c *Client) DeleteMessage(ctx context.Context, id int64) error {
@@ -83,6 +108,15 @@ func (c *Client) get(ctx context.Context, p string, out interface{}) error {
 	}
 	c.applyAuth(req)
 	return c.do(req, out)
+}
+
+func (c *Client) patch(ctx context.Context, p string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, c.BaseURL+p, nil)
+	if err != nil {
+		return err
+	}
+	c.applyAuth(req)
+	return c.do(req, nil)
 }
 
 func (c *Client) del(ctx context.Context, p string) error {

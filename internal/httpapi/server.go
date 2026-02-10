@@ -37,6 +37,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/healthz", s.health)
 	mux.HandleFunc("/api/v1/log", s.authUser(s.handleLog))
 	mux.HandleFunc("/api/v1/messages", s.authUser(s.handleMessages))
+	mux.HandleFunc("/api/v1/messages/unread-count", s.authUser(s.handleUnreadCount))
 	mux.HandleFunc("/api/v1/messages/", s.authUser(s.handleMessageID))
 
 	if s.cfg.UIEnabled {
@@ -166,7 +167,13 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 				limit = n
 			}
 		}
-		msgs, err := s.db.ListMessages(ctx.User.ID, limit)
+		offset := 0
+		if v := r.URL.Query().Get("offset"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+				offset = n
+			}
+		}
+		msgs, err := s.db.ListMessages(ctx.User.ID, limit, offset)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "db error"})
 			return
@@ -177,22 +184,68 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 }
 
-func (s *Server) handleMessageID(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodDelete {
+func (s *Server) handleUnreadCount(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
 	}
+	ctx := userFrom(r)
+	count, err := s.db.CountUnread(ctx.User.ID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "db error"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"unread_count": count})
+}
+
+func (s *Server) handleMessageID(w http.ResponseWriter, r *http.Request) {
 	idStr := strings.TrimPrefix(r.URL.Path, "/api/v1/messages/")
 	id, err := strconv.ParseInt(idStr, 10, 64)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid id"})
 		return
 	}
-	if err := s.db.DeleteMessage(id); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "db error"})
-		return
+	ctx := userFrom(r)
+
+	switch r.Method {
+	case http.MethodGet:
+		msg, ok, err := s.db.GetMessage(id)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "db error"})
+			return
+		}
+		if !ok || msg.UserID != ctx.User.ID {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "message not found"})
+			return
+		}
+		writeJSON(w, http.StatusOK, msg)
+
+	case http.MethodPatch:
+		msg, ok, err := s.db.GetMessage(id)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "db error"})
+			return
+		}
+		if !ok || msg.UserID != ctx.User.ID {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "message not found"})
+			return
+		}
+		if err := s.db.MarkMessageRead(id, ctx.User.ID); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "db error"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "read"})
+
+	case http.MethodDelete:
+		if err := s.db.DeleteMessage(id, ctx.User.ID); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "db error"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
 func (s *Server) adminOnly(next http.HandlerFunc) http.HandlerFunc {

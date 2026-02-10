@@ -144,11 +144,11 @@ func (d *DB) UpdateUserKey(id, key string) error {
 }
 
 type Message struct {
-	ID        int64
-	UserID    string
-	Body      string
-	CreatedAt time.Time
-	ReadAt    *time.Time
+	ID        int64      `json:"id"`
+	UserID    string     `json:"user_id"`
+	Body      string     `json:"body"`
+	CreatedAt time.Time  `json:"created_at"`
+	ReadAt    *time.Time `json:"read_at"`
 }
 
 func (d *DB) CreateMessage(m Message) (int64, error) {
@@ -160,8 +160,33 @@ func (d *DB) CreateMessage(m Message) (int64, error) {
 	return res.LastInsertId()
 }
 
-func (d *DB) ListMessages(userID string, limit int) ([]Message, error) {
-	rows, err := d.conn.Query(`SELECT id,user_id,body,created_at,read_at FROM messages WHERE user_id=? ORDER BY id DESC LIMIT ?`, userID, limit)
+func (d *DB) GetMessage(id int64) (Message, bool, error) {
+	var m Message
+	var created, read sql.NullString
+	err := d.conn.QueryRow(`SELECT id,user_id,body,created_at,read_at FROM messages WHERE id=?`, id).
+		Scan(&m.ID, &m.UserID, &m.Body, &created, &read)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Message{}, false, nil
+	}
+	if err != nil {
+		return Message{}, false, err
+	}
+	m.CreatedAt, _ = time.Parse(time.RFC3339, created.String)
+	if read.Valid {
+		t, _ := time.Parse(time.RFC3339, read.String)
+		m.ReadAt = &t
+	}
+	return m, true, nil
+}
+
+func (d *DB) CountUnread(userID string) (int, error) {
+	var count int
+	err := d.conn.QueryRow(`SELECT COUNT(*) FROM messages WHERE user_id=? AND read_at IS NULL`, userID).Scan(&count)
+	return count, err
+}
+
+func (d *DB) ListMessages(userID string, limit, offset int) ([]Message, error) {
+	rows, err := d.conn.Query(`SELECT id,user_id,body,created_at,read_at FROM messages WHERE user_id=? ORDER BY id DESC LIMIT ? OFFSET ?`, userID, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -183,13 +208,13 @@ func (d *DB) ListMessages(userID string, limit int) ([]Message, error) {
 	return out, rows.Err()
 }
 
-func (d *DB) DeleteMessage(id int64) error {
-	_, err := d.conn.Exec(`DELETE FROM messages WHERE id=?`, id)
+func (d *DB) DeleteMessage(id int64, userID string) error {
+	_, err := d.conn.Exec(`DELETE FROM messages WHERE id=? AND user_id=?`, id, userID)
 	return err
 }
 
-func (d *DB) MarkMessageRead(id int64) error {
-	_, err := d.conn.Exec(`UPDATE messages SET read_at=? WHERE id=?`, time.Now().UTC().Format(time.RFC3339), id)
+func (d *DB) MarkMessageRead(id int64, userID string) error {
+	_, err := d.conn.Exec(`UPDATE messages SET read_at=? WHERE id=? AND user_id=?`, time.Now().UTC().Format(time.RFC3339), id, userID)
 	return err
 }
 
