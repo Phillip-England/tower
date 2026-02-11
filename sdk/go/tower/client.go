@@ -7,88 +7,53 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"strconv"
 	"time"
 )
 
 type Client struct {
 	BaseURL string
-	UserID  string
 	Key     string
 	HTTP    *http.Client
 }
 
-type Message struct {
-	ID        int64      `json:"id"`
-	UserID    string     `json:"user_id"`
-	Body      string     `json:"body"`
-	CreatedAt time.Time  `json:"created_at"`
-	ReadAt    *time.Time `json:"read_at"`
-}
-
-func New(baseURL, userID, key string) *Client {
+func New(baseURL, key string) *Client {
 	return &Client{
 		BaseURL: baseURL,
-		UserID:  userID,
 		Key:     key,
 		HTTP:    &http.Client{Timeout: 10 * time.Second},
 	}
 }
 
-func (c *Client) LogRequest(ctx context.Context, method, path, ip string) error {
+// Decision represents Tower's escalation decision for an IP.
+type Decision struct {
+	Action     string `json:"action"`      // ALLOW, FLAG, THROTTLE, BAN
+	IP         string `json:"ip"`
+	Reason     string `json:"reason,omitempty"`
+	RetryAfter int    `json:"retry_after,omitempty"`
+}
+
+// Inspect checks an IP against Tower without recording a request.
+func (c *Client) Inspect(ctx context.Context, ip string) (Decision, error) {
+	var d Decision
+	err := c.post(ctx, "/api/v1/inspect", map[string]string{"ip": ip}, &d)
+	return d, err
+}
+
+// LogRequest reports a request to Tower for rate limiting and returns the decision.
+func (c *Client) LogRequest(ctx context.Context, method, path, ip string) (Decision, error) {
+	var d Decision
 	payload := map[string]string{
 		"method": method,
 		"path":   path,
 		"ip":     ip,
 	}
-	return c.post(ctx, "/api/v1/log", payload, nil)
+	err := c.post(ctx, "/api/v1/log", payload, &d)
+	return d, err
 }
 
-func (c *Client) SendMessage(ctx context.Context, body string) (int64, error) {
-	var resp struct {
-		ID int64 `json:"id"`
-	}
-	err := c.post(ctx, "/api/v1/messages", map[string]string{"body": body}, &resp)
-	return resp.ID, err
-}
-
-func (c *Client) ListMessages(ctx context.Context, limit, offset int) ([]Message, error) {
-	endpoint := "/api/v1/messages"
-	params := url.Values{}
-	if limit > 0 {
-		params.Set("limit", strconv.Itoa(limit))
-	}
-	if offset > 0 {
-		params.Set("offset", strconv.Itoa(offset))
-	}
-	if len(params) > 0 {
-		endpoint += "?" + params.Encode()
-	}
-	var msgs []Message
-	err := c.get(ctx, endpoint, &msgs)
-	return msgs, err
-}
-
-func (c *Client) GetMessage(ctx context.Context, id int64) (Message, error) {
-	var msg Message
-	err := c.get(ctx, fmt.Sprintf("/api/v1/messages/%d", id), &msg)
-	return msg, err
-}
-
-func (c *Client) MarkMessageRead(ctx context.Context, id int64) error {
-	return c.patch(ctx, fmt.Sprintf("/api/v1/messages/%d", id))
-}
-
-func (c *Client) UnreadCount(ctx context.Context) (int, error) {
-	var resp struct {
-		UnreadCount int `json:"unread_count"`
-	}
-	err := c.get(ctx, "/api/v1/messages/unread-count", &resp)
-	return resp.UnreadCount, err
-}
-
-func (c *Client) DeleteMessage(ctx context.Context, id int64) error {
-	return c.del(ctx, fmt.Sprintf("/api/v1/messages/%d", id))
+// RegisterCallback registers a URL to receive security event notifications.
+func (c *Client) RegisterCallback(ctx context.Context, callbackURL string) error {
+	return c.post(ctx, "/api/v1/callbacks", map[string]string{"url": callbackURL}, nil)
 }
 
 func (c *Client) post(ctx context.Context, p string, payload interface{}, out interface{}) error {
@@ -108,24 +73,6 @@ func (c *Client) get(ctx context.Context, p string, out interface{}) error {
 	}
 	c.applyAuth(req)
 	return c.do(req, out)
-}
-
-func (c *Client) patch(ctx context.Context, p string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, c.BaseURL+p, nil)
-	if err != nil {
-		return err
-	}
-	c.applyAuth(req)
-	return c.do(req, nil)
-}
-
-func (c *Client) del(ctx context.Context, p string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.BaseURL+p, nil)
-	if err != nil {
-		return err
-	}
-	c.applyAuth(req)
-	return c.do(req, nil)
 }
 
 func (c *Client) do(req *http.Request, out interface{}) error {
@@ -156,7 +103,6 @@ func (c *Client) do(req *http.Request, out interface{}) error {
 
 func (c *Client) applyAuth(req *http.Request) {
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Tower-User", c.UserID)
 	req.Header.Set("X-Tower-Key", c.Key)
 }
 

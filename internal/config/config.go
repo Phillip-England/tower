@@ -17,11 +17,9 @@ type Config struct {
 	ThrottleWindow   time.Duration
 	ThrottleLimit    int
 	BanDuration      time.Duration
-	MessageWindow    time.Duration
-	MessageLimit     int
 	InMemoryLogLimit int
-	AdminToken       string
-	UIEnabled        bool
+	AdminToken      string
+	CleanupInterval time.Duration // how often the background cleanup runs
 }
 
 func DefaultDataDir() string {
@@ -47,10 +45,8 @@ func DefaultConfig() Config {
 		ThrottleWindow:   24 * time.Hour,
 		ThrottleLimit:    5,
 		BanDuration:      24 * time.Hour,
-		MessageWindow:    60 * time.Second,
-		MessageLimit:     10,
 		InMemoryLogLimit: 5000,
-		UIEnabled:        true,
+		CleanupInterval:  1 * time.Hour,
 	}
 }
 

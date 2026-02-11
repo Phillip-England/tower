@@ -1,7 +1,11 @@
 package logic
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -10,12 +14,29 @@ import (
 	"tower/internal/db"
 )
 
+// Action represents the escalation decision for an IP.
+type Action string
+
+const (
+	ActionAllow    Action = "ALLOW"
+	ActionFlag     Action = "FLAG"
+	ActionThrottle Action = "THROTTLE"
+	ActionBan      Action = "BAN"
+)
+
+// Decision is the result of inspecting or logging a request.
+type Decision struct {
+	Action     Action `json:"action"`
+	IP         string `json:"ip"`
+	Reason     string `json:"reason,omitempty"`
+	RetryAfter int    `json:"retry_after,omitempty"` // seconds
+}
+
 type RequestLog struct {
 	Time   time.Time
 	IP     string
 	Method string
 	Path   string
-	UserID string
 }
 
 type Limiter struct {
@@ -24,10 +45,11 @@ type Limiter struct {
 
 	mu             sync.Mutex
 	reqByIP        map[string][]time.Time
+	flaggedIPs     map[string]time.Time // first-time suspicious behavior
 	throttleByIP   map[string][]time.Time
-	msgByUser      map[string][]time.Time
 	bannedCache    map[string]db.Ban
 	recentRequests []RequestLog
+	callbacks      []string // callback URLs
 }
 
 func NewLimiter(cfg config.Config, d *db.DB) *Limiter {
@@ -35,11 +57,49 @@ func NewLimiter(cfg config.Config, d *db.DB) *Limiter {
 		cfg:            cfg,
 		db:             d,
 		reqByIP:        make(map[string][]time.Time),
+		flaggedIPs:     make(map[string]time.Time),
 		throttleByIP:   make(map[string][]time.Time),
-		msgByUser:      make(map[string][]time.Time),
 		bannedCache:    make(map[string]db.Ban),
 		recentRequests: make([]RequestLog, 0, cfg.InMemoryLogLimit),
 	}
+}
+
+// StartCleanup launches a background goroutine that periodically removes
+// expired bans and reclaims disk space. It stops when the context is cancelled.
+func (l *Limiter) StartCleanup(ctx context.Context) {
+	interval := l.cfg.CleanupInterval
+	if interval <= 0 {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				l.runCleanup()
+			}
+		}
+	}()
+}
+
+func (l *Limiter) runCleanup() {
+	// 1. Delete expired bans from DB and evict from cache.
+	deleted, _ := l.db.DeleteExpiredBans()
+	if deleted > 0 {
+		l.mu.Lock()
+		for ip, b := range l.bannedCache {
+			if b.ExpiresAt != nil && time.Now().After(*b.ExpiresAt) {
+				delete(l.bannedCache, ip)
+			}
+		}
+		l.mu.Unlock()
+	}
+
+	// 2. Reclaim freed disk space.
+	l.db.IncrementalVacuum()
 }
 
 func (l *Limiter) LoadBans() error {
@@ -70,7 +130,36 @@ func (l *Limiter) IsBanned(ip string) (bool, db.Ban) {
 	return true, b
 }
 
-func (l *Limiter) LogRequest(r RequestLog) (throttled bool, banned bool) {
+// Inspect checks an IP against the current state without recording a request.
+func (l *Limiter) Inspect(ip string) Decision {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	// Check ban first
+	if b, ok := l.bannedCache[ip]; ok {
+		if b.ExpiresAt != nil && time.Now().After(*b.ExpiresAt) {
+			delete(l.bannedCache, ip)
+			_ = l.db.UnbanIP(ip)
+		} else {
+			return Decision{Action: ActionBan, IP: ip, Reason: b.Reason}
+		}
+	}
+
+	// Check throttle state
+	throttles := prune(l.throttleByIP[ip], l.cfg.ThrottleWindow)
+	if len(throttles) > 0 {
+		return Decision{Action: ActionThrottle, IP: ip, Reason: "rate limit exceeded", RetryAfter: int(l.cfg.RequestWindow.Seconds())}
+	}
+
+	// Check flagged state
+	if _, flagged := l.flaggedIPs[ip]; flagged {
+		return Decision{Action: ActionFlag, IP: ip, Reason: "suspicious activity detected"}
+	}
+
+	return Decision{Action: ActionAllow, IP: ip}
+}
+
+func (l *Limiter) LogRequest(r RequestLog) Decision {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -80,21 +169,29 @@ func (l *Limiter) LogRequest(r RequestLog) (throttled bool, banned bool) {
 	}
 	l.recentRequests = append(l.recentRequests, r)
 
-	// rate limit
+	// rate limit check
 	l.reqByIP[r.IP] = prune(l.reqByIP[r.IP], l.cfg.RequestWindow)
 	l.reqByIP[r.IP] = append(l.reqByIP[r.IP], r.Time)
-	if len(l.reqByIP[r.IP]) <= l.cfg.RequestLimit {
-		return false, false
+	count := len(l.reqByIP[r.IP])
+
+	// Under limit: allow
+	if count <= l.cfg.RequestLimit {
+		return Decision{Action: ActionAllow, IP: r.IP}
 	}
 
-	// throttled
-	throttled = true
+	// First time exceeding limit: flag
+	if _, flagged := l.flaggedIPs[r.IP]; !flagged {
+		l.flaggedIPs[r.IP] = r.Time
+		return Decision{Action: ActionFlag, IP: r.IP, Reason: "suspicious activity detected"}
+	}
+
+	// Repeated violations: throttle
 	l.throttleByIP[r.IP] = prune(l.throttleByIP[r.IP], l.cfg.ThrottleWindow)
 	l.throttleByIP[r.IP] = append(l.throttleByIP[r.IP], r.Time)
 	if len(l.throttleByIP[r.IP]) >= l.cfg.ThrottleLimit {
-		banned = true
+		return Decision{Action: ActionBan, IP: r.IP, Reason: "auto-ban: repeated throttling"}
 	}
-	return throttled, banned
+	return Decision{Action: ActionThrottle, IP: r.IP, Reason: "rate limit exceeded", RetryAfter: int(l.cfg.RequestWindow.Seconds())}
 }
 
 func (l *Limiter) RecordBan(ip, reason string) (db.Ban, error) {
@@ -144,23 +241,82 @@ func (l *Limiter) Unban(ip string) error {
 	return l.db.UnbanIP(ip)
 }
 
-func (l *Limiter) CanSendMessage(userID string) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.msgByUser[userID] = prune(l.msgByUser[userID], l.cfg.MessageWindow)
-	if len(l.msgByUser[userID]) >= l.cfg.MessageLimit {
-		return false
-	}
-	l.msgByUser[userID] = append(l.msgByUser[userID], time.Now())
-	return true
-}
-
 func (l *Limiter) RecentRequests() []RequestLog {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	out := make([]RequestLog, len(l.recentRequests))
 	copy(out, l.recentRequests)
 	return out
+}
+
+// RegisterCallback adds a URL that will be notified on security events.
+func (l *Limiter) RegisterCallback(url string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, u := range l.callbacks {
+		if u == url {
+			return
+		}
+	}
+	l.callbacks = append(l.callbacks, url)
+}
+
+// UnregisterCallback removes a callback URL.
+func (l *Limiter) UnregisterCallback(url string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for i, u := range l.callbacks {
+		if u == url {
+			l.callbacks = append(l.callbacks[:i], l.callbacks[i+1:]...)
+			return
+		}
+	}
+}
+
+// Callbacks returns the registered callback URLs.
+func (l *Limiter) Callbacks() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make([]string, len(l.callbacks))
+	copy(out, l.callbacks)
+	return out
+}
+
+// NotifyCallbacks sends a security event to all registered callback URLs.
+func (l *Limiter) NotifyCallbacks(d Decision) {
+	l.mu.Lock()
+	urls := make([]string, len(l.callbacks))
+	copy(urls, l.callbacks)
+	l.mu.Unlock()
+
+	if len(urls) == 0 || d.Action == ActionAllow {
+		return
+	}
+
+	payload, _ := json.Marshal(d)
+	for _, u := range urls {
+		go func(target string) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(payload))
+			if err != nil {
+				return
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Tower-Event", string(d.Action))
+			resp, err := http.DefaultClient.Do(req)
+			if err == nil {
+				resp.Body.Close()
+			}
+		}(u)
+	}
+}
+
+// Stats returns current limiter statistics.
+func (l *Limiter) Stats() (activeBans, flaggedIPs, trackedIPs, recentReqs int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.bannedCache), len(l.flaggedIPs), len(l.reqByIP), len(l.recentRequests)
 }
 
 func prune(ts []time.Time, window time.Duration) []time.Time {

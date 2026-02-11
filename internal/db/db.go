@@ -3,7 +3,6 @@ package db
 import (
 	"database/sql"
 	"errors"
-	"fmt"
 	"path/filepath"
 	"time"
 
@@ -23,6 +22,11 @@ func Open(dataDir string) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Enable incremental auto-vacuum so deleted rows reclaim disk space.
+	if _, err := conn.Exec(`PRAGMA auto_vacuum = INCREMENTAL`); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
 	if err := migrate(conn); err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -37,20 +41,6 @@ func migrate(conn *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS settings (
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL
-		);`,
-		`CREATE TABLE IF NOT EXISTS users (
-			id TEXT PRIMARY KEY,
-			name TEXT NOT NULL,
-			message_key TEXT NOT NULL,
-			created_at TEXT NOT NULL
-		);`,
-		`CREATE TABLE IF NOT EXISTS messages (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			user_id TEXT NOT NULL,
-			body TEXT NOT NULL,
-			created_at TEXT NOT NULL,
-			read_at TEXT,
-			FOREIGN KEY(user_id) REFERENCES users(id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS banned_ips (
 			ip TEXT PRIMARY KEY,
@@ -83,146 +73,6 @@ func (d *DB) SetSetting(key, value string) error {
 	_, err := d.conn.Exec(`INSERT INTO settings(key,value) VALUES(?,?)
 		ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value)
 	return err
-}
-
-type User struct {
-	ID         string
-	Name       string
-	MessageKey string
-	CreatedAt  time.Time
-}
-
-func (d *DB) CreateUser(u User) error {
-	_, err := d.conn.Exec(`INSERT INTO users(id,name,message_key,created_at) VALUES(?,?,?,?)`,
-		u.ID, u.Name, u.MessageKey, u.CreatedAt.UTC().Format(time.RFC3339))
-	return err
-}
-
-func (d *DB) GetUser(id string) (User, bool, error) {
-	var u User
-	var created string
-	err := d.conn.QueryRow(`SELECT id,name,message_key,created_at FROM users WHERE id=?`, id).
-		Scan(&u.ID, &u.Name, &u.MessageKey, &created)
-	if errors.Is(err, sql.ErrNoRows) {
-		return User{}, false, nil
-	}
-	if err != nil {
-		return User{}, false, err
-	}
-	u.CreatedAt, _ = time.Parse(time.RFC3339, created)
-	return u, true, nil
-}
-
-func (d *DB) ListUsers() ([]User, error) {
-	rows, err := d.conn.Query(`SELECT id,name,message_key,created_at FROM users ORDER BY created_at ASC`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []User
-	for rows.Next() {
-		var u User
-		var created string
-		if err := rows.Scan(&u.ID, &u.Name, &u.MessageKey, &created); err != nil {
-			return nil, err
-		}
-		u.CreatedAt, _ = time.Parse(time.RFC3339, created)
-		out = append(out, u)
-	}
-	return out, rows.Err()
-}
-
-func (d *DB) UpdateUserKey(id, key string) error {
-	res, err := d.conn.Exec(`UPDATE users SET message_key=? WHERE id=?`, key, id)
-	if err != nil {
-		return err
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return fmt.Errorf("user not found")
-	}
-	return nil
-}
-
-type Message struct {
-	ID        int64      `json:"id"`
-	UserID    string     `json:"user_id"`
-	Body      string     `json:"body"`
-	CreatedAt time.Time  `json:"created_at"`
-	ReadAt    *time.Time `json:"read_at"`
-}
-
-func (d *DB) CreateMessage(m Message) (int64, error) {
-	res, err := d.conn.Exec(`INSERT INTO messages(user_id,body,created_at,read_at) VALUES(?,?,?,?)`,
-		m.UserID, m.Body, m.CreatedAt.UTC().Format(time.RFC3339), nullableTime(m.ReadAt))
-	if err != nil {
-		return 0, err
-	}
-	return res.LastInsertId()
-}
-
-func (d *DB) GetMessage(id int64) (Message, bool, error) {
-	var m Message
-	var created, read sql.NullString
-	err := d.conn.QueryRow(`SELECT id,user_id,body,created_at,read_at FROM messages WHERE id=?`, id).
-		Scan(&m.ID, &m.UserID, &m.Body, &created, &read)
-	if errors.Is(err, sql.ErrNoRows) {
-		return Message{}, false, nil
-	}
-	if err != nil {
-		return Message{}, false, err
-	}
-	m.CreatedAt, _ = time.Parse(time.RFC3339, created.String)
-	if read.Valid {
-		t, _ := time.Parse(time.RFC3339, read.String)
-		m.ReadAt = &t
-	}
-	return m, true, nil
-}
-
-func (d *DB) CountUnread(userID string) (int, error) {
-	var count int
-	err := d.conn.QueryRow(`SELECT COUNT(*) FROM messages WHERE user_id=? AND read_at IS NULL`, userID).Scan(&count)
-	return count, err
-}
-
-func (d *DB) ListMessages(userID string, limit, offset int) ([]Message, error) {
-	rows, err := d.conn.Query(`SELECT id,user_id,body,created_at,read_at FROM messages WHERE user_id=? ORDER BY id DESC LIMIT ? OFFSET ?`, userID, limit, offset)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []Message
-	for rows.Next() {
-		var m Message
-		var created, read sql.NullString
-		if err := rows.Scan(&m.ID, &m.UserID, &m.Body, &created, &read); err != nil {
-			return nil, err
-		}
-		m.CreatedAt, _ = time.Parse(time.RFC3339, created.String)
-		if read.Valid {
-			t, _ := time.Parse(time.RFC3339, read.String)
-			m.ReadAt = &t
-		}
-		out = append(out, m)
-	}
-	return out, rows.Err()
-}
-
-func (d *DB) DeleteMessage(id int64, userID string) error {
-	_, err := d.conn.Exec(`DELETE FROM messages WHERE id=? AND user_id=?`, id, userID)
-	return err
-}
-
-func (d *DB) MarkMessageRead(id int64, userID string) error {
-	_, err := d.conn.Exec(`UPDATE messages SET read_at=? WHERE id=? AND user_id=?`, time.Now().UTC().Format(time.RFC3339), id, userID)
-	return err
-}
-
-func nullableTime(t *time.Time) interface{} {
-	if t == nil {
-		return nil
-	}
-	return t.UTC().Format(time.RFC3339)
 }
 
 type Ban struct {
@@ -284,4 +134,27 @@ func (d *DB) GetBan(ip string) (Ban, bool, error) {
 		b.ExpiresAt = &t
 	}
 	return b, true, nil
+}
+
+// DeleteExpiredBans removes all bans whose expires_at is in the past.
+func (d *DB) DeleteExpiredBans() (int64, error) {
+	res, err := d.conn.Exec(`DELETE FROM banned_ips WHERE expires_at IS NOT NULL AND expires_at < ?`,
+		time.Now().UTC().Format(time.RFC3339))
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// IncrementalVacuum reclaims free pages from the database file.
+func (d *DB) IncrementalVacuum() error {
+	_, err := d.conn.Exec(`PRAGMA incremental_vacuum`)
+	return err
+}
+
+func nullableTime(t *time.Time) any {
+	if t == nil {
+		return nil
+	}
+	return t.UTC().Format(time.RFC3339)
 }

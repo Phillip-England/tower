@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -25,20 +26,14 @@ func main() {
 	switch os.Args[1] {
 	case "serve":
 		serveCmd(os.Args[2:])
-	case "create-user":
-		createUserCmd(os.Args[2:])
-	case "list-users":
-		listUsersCmd(os.Args[2:])
-	case "rotate-key":
-		rotateKeyCmd(os.Args[2:])
+	case "status":
+		statusCmd(os.Args[2:])
 	case "ban-ip":
 		banIPCmd(os.Args[2:])
 	case "unban-ip":
 		unbanIPCmd(os.Args[2:])
 	case "list-bans":
 		listBansCmd(os.Args[2:])
-	case "admin-token":
-		adminTokenCmd(os.Args[2:])
 	default:
 		usage()
 		os.Exit(1)
@@ -46,18 +41,14 @@ func main() {
 }
 
 func usage() {
-	fmt.Println(`tower - central hub server
+	fmt.Println(`tower - centralized rate limiting & IP ban management
 
 Commands:
   serve         Start HTTP server
-  create-user   Create a new user
-  list-users    List users
-  rotate-key    Rotate message key for a user
+  status        Display system status and metrics
   ban-ip        Ban an IP manually
   unban-ip      Remove IP ban
-  list-bans     List banned IPs
-  admin-token   Print admin token
-`)
+  list-bans     List banned IPs`)
 }
 
 func commonFlags(fs *flag.FlagSet) *string {
@@ -76,18 +67,7 @@ func openDB(dataDir string) *db.DB {
 	return d
 }
 
-func ensureAdmin(d *db.DB) (string, error) {
-	// admin user
-	if _, ok, err := d.GetUser("admin"); err != nil {
-		return "", err
-	} else if !ok {
-		key, err := config.NewToken(24)
-		if err != nil {
-			return "", err
-		}
-		_ = d.CreateUser(db.User{ID: "admin", Name: "Admin", MessageKey: key, CreatedAt: time.Now()})
-	}
-	// admin token
+func ensureAdminToken(d *db.DB) (string, error) {
 	if tok, ok, err := d.GetSetting("admin_token"); err != nil {
 		return "", err
 	} else if ok {
@@ -107,12 +87,11 @@ func serveCmd(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	dataDir := commonFlags(fs)
 	addr := fs.String("addr", ":8080", "listen address")
-	ui := fs.Bool("ui", true, "enable admin UI")
 	fs.Parse(args)
 
 	d := openDB(*dataDir)
 	defer d.Close()
-	adminToken, err := ensureAdmin(d)
+	adminToken, err := ensureAdminToken(d)
 	if err != nil {
 		log.Fatalf("admin: %v", err)
 	}
@@ -120,13 +99,17 @@ func serveCmd(args []string) {
 	cfg := config.DefaultConfig()
 	cfg.DataDir = *dataDir
 	cfg.Addr = *addr
-	cfg.UIEnabled = *ui
 	cfg.AdminToken = adminToken
 
 	lim := logic.NewLimiter(cfg, d)
 	if err := lim.LoadBans(); err != nil {
 		log.Fatalf("load bans: %v", err)
 	}
+
+	// Start background DB cleanup (expired bans, vacuum).
+	cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
+	defer cleanupCancel()
+	lim.StartCleanup(cleanupCtx)
 
 	srv, err := httpapi.NewServer(cfg, d, lim, adminToken)
 	if err != nil {
@@ -141,62 +124,39 @@ func serveCmd(args []string) {
 	}
 }
 
-func createUserCmd(args []string) {
-	fs := flag.NewFlagSet("create-user", flag.ExitOnError)
-	dataDir := commonFlags(fs)
-	name := fs.String("name", "", "user name")
-	id := fs.String("id", "", "user id (optional)")
-	fs.Parse(args)
-
-	if strings.TrimSpace(*name) == "" {
-		log.Fatal("--name required")
-	}
-	if *id == "" {
-		*id = strings.ToLower(strings.ReplaceAll(*name, " ", "-"))
-	}
-	key, _ := config.NewToken(24)
-
-	d := openDB(*dataDir)
-	defer d.Close()
-	if err := d.CreateUser(db.User{ID: *id, Name: *name, MessageKey: key, CreatedAt: time.Now()}); err != nil {
-		log.Fatalf("create user: %v", err)
-	}
-	fmt.Printf("user_id=%s\nmessage_key=%s\n", *id, key)
-}
-
-func listUsersCmd(args []string) {
-	fs := flag.NewFlagSet("list-users", flag.ExitOnError)
+func statusCmd(args []string) {
+	fs := flag.NewFlagSet("status", flag.ExitOnError)
 	dataDir := commonFlags(fs)
 	fs.Parse(args)
 
 	d := openDB(*dataDir)
 	defer d.Close()
-	users, err := d.ListUsers()
-	if err != nil {
-		log.Fatalf("list users: %v", err)
-	}
-	for _, u := range users {
-		fmt.Printf("%s\t%s\t%s\n", u.ID, u.Name, u.MessageKey)
-	}
-}
 
-func rotateKeyCmd(args []string) {
-	fs := flag.NewFlagSet("rotate-key", flag.ExitOnError)
-	dataDir := commonFlags(fs)
-	id := fs.String("id", "", "user id")
-	fs.Parse(args)
+	bans, _ := d.ListBans()
 
-	if *id == "" {
-		log.Fatal("--id required")
+	activeBans := 0
+	expiredBans := 0
+	for _, b := range bans {
+		if b.ExpiresAt != nil && time.Now().After(*b.ExpiresAt) {
+			expiredBans++
+		} else {
+			activeBans++
+		}
 	}
-	key, _ := config.NewToken(24)
 
-	d := openDB(*dataDir)
-	defer d.Close()
-	if err := d.UpdateUserKey(*id, key); err != nil {
-		log.Fatalf("rotate key: %v", err)
-	}
-	fmt.Printf("user_id=%s\nmessage_key=%s\n", *id, key)
+	cfg := config.DefaultConfig()
+	fmt.Println("Tower Status")
+	fmt.Println(strings.Repeat("-", 40))
+	fmt.Printf("Data directory:    %s\n", filepath.Clean(*dataDir))
+	fmt.Printf("Active bans:       %d\n", activeBans)
+	fmt.Printf("Expired bans:      %d\n", expiredBans)
+	fmt.Println()
+	fmt.Println("Rate Limit Config")
+	fmt.Println(strings.Repeat("-", 40))
+	fmt.Printf("Request limit:     %d / %s\n", cfg.RequestLimit, cfg.RequestWindow)
+	fmt.Printf("Throttle limit:    %d violations / %s\n", cfg.ThrottleLimit, cfg.ThrottleWindow)
+	fmt.Printf("Ban duration:      %s\n", cfg.BanDuration)
+	fmt.Printf("In-memory log cap: %d\n", cfg.InMemoryLogLimit)
 }
 
 func banIPCmd(args []string) {
@@ -261,16 +221,3 @@ func listBansCmd(args []string) {
 	}
 }
 
-func adminTokenCmd(args []string) {
-	fs := flag.NewFlagSet("admin-token", flag.ExitOnError)
-	dataDir := commonFlags(fs)
-	fs.Parse(args)
-
-	d := openDB(*dataDir)
-	defer d.Close()
-	tok, err := ensureAdmin(d)
-	if err != nil {
-		log.Fatalf("admin token: %v", err)
-	}
-	fmt.Printf("%s\n", tok)
-}
